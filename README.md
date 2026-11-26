@@ -81,5 +81,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 编码归一逐文件续做
+
+`encoding_norm` 额外维护一份内部账本 `_encoding_receipts`（不进模块看板），
+按「来源文件 + 原行号」给每个文件一份可逐项处理的转码回执：
+
+- 同一文件同内容重复提交（中断重启后重放）只记一次，直接复用原回执；
+- 同名文件内容变化记为新的修订版，旧回执的损字行号、原始字符与转码结论原样保留；
+- 回执保留 `损字凭据`（原行号、原始字符、原行文本、采用的转码结果），
+  已接受的文件不再返回 `可重跑`，只保留可查看的历史证据；
+- 坏行隔离用 `consume_lossy_receipt` 消费损字隔离清单，重复消费只补建缺失行；
+- 损字行必须复核生效（`复核中`）后才能按原行回补，回补写入 `field_parse`
+  并带上 `来源文件 / 来源回执 / 回补来源`，同一来源文件同一原行跨修订版只计一次。
+
+接口（固定路径，注册在通用 `/{module}/{entry_id}` 之前）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/encoding_norm/receipts` | 逐文件回执目录，含历史损字证据 |
+| POST | `/api/encoding_norm/receipts` | 提交单文件转码（同内容去重） |
+| GET | `/api/encoding_norm/receipts/{回执编号}` | 单文件回执与当前可继续操作 |
+| POST | `/api/encoding_norm/receipts/{回执编号}/resume` | 从已确认行继续 |
+| GET | `/api/encoding_norm/receipts/{回执编号}/next` | 下一个待处理行 |
+| POST | `/api/encoding_norm/receipts/{回执编号}/consume` | 坏行隔离消费损字清单 |
+| GET | `/api/encoding_norm/receipts/{回执编号}/review` | 逐原行的采用结果/回补结果 |
+| POST | `/api/row_quarantine/{隔离编号}/reinstate` | 复核生效后按原行回补 |
+
+前端在编码归一页底部展示逐文件回执面板（`frontend/src/views/EncodingReceipts.vue`）。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

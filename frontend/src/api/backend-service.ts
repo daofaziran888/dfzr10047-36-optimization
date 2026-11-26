@@ -1,6 +1,14 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  FileSummary,
+  OverviewResult,
+  PageResult,
+  ReceiptReviewItem,
+  TranscodeReceipt,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +65,57 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+export async function listReceipts(intakeBatch?: string): Promise<{ items: FileSummary[]; total: number }> {
+  const query = intakeBatch ? `?intake_batch=${encodeURIComponent(intakeBatch)}` : ''
+  const response = await request(`/api/encoding_norm/receipts${query}`)
+  if (!response.ok) throw new Error('逐文件转码回执读取失败')
+  return await response.json()
+}
+
+export async function submitReceipt(payload: {
+  file_key: string
+  file_name?: string
+  intake_batch?: string
+  source_encoding: string
+  target_encoding: string
+  strategy?: string
+  content: string
+  transcode_time?: string
+}): Promise<ActionResult & { entry?: TranscodeReceipt | null }> {
+  const response = await request('/api/encoding_norm/receipts', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  return await response.json()
+}
+
+export async function resumeReceipt(
+  receiptNo: string,
+  processedLines: number[],
+  resumedFrom?: number,
+): Promise<ActionResult & { entry?: TranscodeReceipt | null }> {
+  const response = await request(`/api/encoding_norm/receipts/${encodeURIComponent(receiptNo)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ processed_lines: processedLines, resumed_from: resumedFrom }),
+  })
+  return await response.json()
+}
+
+export async function loadReceiptReview(receiptNo: string): Promise<{
+  receiptNo: string
+  items: ReceiptReviewItem[]
+}> {
+  const response = await request(`/api/encoding_norm/receipts/${encodeURIComponent(receiptNo)}/review`)
+  if (!response.ok) throw new Error('回执复核结果读取失败')
+  const payload = await response.json()
+  return { receiptNo, items: payload.items ?? [] }
+}
+
+export async function loadReceiptNext(receiptNo: string): Promise<Record<string, unknown>> {
+  const response = await request(`/api/encoding_norm/receipts/${encodeURIComponent(receiptNo)}/next`)
+  if (!response.ok) throw new Error('回执续做位置读取失败')
   return await response.json()
 }

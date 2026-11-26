@@ -20,8 +20,12 @@ class FieldParseService(BaseModuleService):
     def record_parsed_field(self, parse_no: str, intake_batch: str, template_no: str,
                             field_name: str, raw_value: str, parsed_value: str,
                             elapsed_ms: int, row_num: int,
-                            success: bool) -> dict[str, Any]:
-        """登记单字段解析结果，解析失败的字段连同行号可供坏行隔离消费。"""
+                            success: bool, *, source_file: str = "",
+                            source_receipt: str = "") -> dict[str, Any]:
+        """登记单字段解析结果，解析失败的字段连同行号可供坏行隔离消费。
+
+        字段记录与来源文件/回执关联，后段可回查对应来源文件、原行号与原始字符。
+        """
         rows = store.rows(self.MODULE)
         entry_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
         entry = {
@@ -38,6 +42,10 @@ class FieldParseService(BaseModuleService):
             "解析耗时": str(elapsed_ms),
             "解析行号": str(row_num),
         }
+        if source_file:
+            entry["来源文件"] = source_file
+        if source_receipt:
+            entry["来源回执"] = source_receipt
         rows.append(entry)
         return entry
 
@@ -70,6 +78,49 @@ class FieldParseService(BaseModuleService):
                 else bucket.get("__status", "解析成功")
             )
         return grouped
+
+    def parse_batch_rows(self, batch_files: dict[str, str],
+                         transcoded: dict[str, str]) -> dict[str, Any]:
+        """字段解析同时读取各批转码产物：按原文件去重，同名多修订版只取最新。
+
+        batch_files：批次 → 原文件键；transcoded：文件键 → 转码后文本。
+        返回逐文件行数、去重后的来源文件清单和实际读取的行。
+        """
+        files: list[str] = []
+        rows_by_file: dict[str, list[str]] = {}
+        for _batch, file_key in batch_files.items():
+            if file_key in files:
+                continue
+            files.append(file_key)
+            rows_by_file[file_key] = [
+                line for line in str(transcoded.get(file_key, "")).splitlines() if line
+            ]
+        return {
+            "files": files,
+            "rows_by_file": rows_by_file,
+            "total_rows": sum(len(rows) for rows in rows_by_file.values()),
+            "dedup_key": "来源文件",
+        }
+
+    def source_trace(self, parse_no: str) -> dict[str, Any]:
+        """归一成功后回查对应来源文件、原行号与当时的原始字符。"""
+        for r in store.rows(self.MODULE):
+            if r.get("解析编号") != parse_no:
+                continue
+            trace = {
+                "解析编号": parse_no,
+                "来源文件": r.get("来源文件", ""),
+                "来源回执": r.get("来源回执", ""),
+                "解析行号": r.get("解析行号", ""),
+                "原始取值": r.get("原始取值", ""),
+            }
+            for q in store.rows("row_quarantine"):
+                if q.get("隔离编号") and q.get("隔离编号") == r.get("回补来源"):
+                    trace["原始字符"] = q.get("原始字符", "")
+                    trace["原始行文本"] = q.get("原始行文本", "")
+                    break
+            return trace
+        return {"解析编号": parse_no, "说明": "解析字段不存在"}
 
     def success_rate(self, intake_batch: str) -> float:
         """批次字段级解析成功率，供解析指标交叉核对。"""

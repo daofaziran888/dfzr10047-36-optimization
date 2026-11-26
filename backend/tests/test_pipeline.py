@@ -2507,3 +2507,173 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 编码归一逐文件回执：批量续做、同名重传、损字凭据与按原行去重
+# ======================================================================
+
+A_FILE = "rec_id,ts,val,bytes\nR-1,2026-09-01 08:10:00,100.5,1024\nR-2,2026-09-01 08:11:00,101.5,2048"
+B_FILE = "rec_id,ts,val,bytes\nR-3,2026-09-01 08:12:00,102.5,3072\nR-4,2026-09-01 08:13:00,103.5,4096"
+B_LOSSY = "rec_id,ts,val,bytes\nR-3X记录,2026-09-01 08:12:00,102.5,3072\nR-4,2026-09-01 08:13:00,103.5,4096"
+B_FIXED = "rec_id,ts,val,bytes\nR-3X,2026-09-01 08:12:00,102.5,3072\nR-4,2026-09-01 08:13:00,103.5,4096"
+
+
+class TestEncodingReceipts:
+    def _submit(self, file_key: str, text: str, encoding: str = "UTF-8",
+                target: str = "ASCII", batch: str = "FI-R1",
+                at: str = "2026-09-03T10:00:00") -> dict:
+        svc = SERVICES["encoding_norm"]
+        return svc.transcode_file(
+            file_key, text.encode(encoding), encoding, target, "REPLACE",
+            file_name=f"{file_key}.csv", intake_batch=batch, transcode_time=at)
+
+    def test_clean_file_receipt_has_no_open_lines(self, fresh_store):
+        receipt = self._submit("FI-R1/A", A_FILE)
+        assert receipt["status"] == "已完成"
+        assert receipt["待处理行号"] == []
+        assert receipt["可继续"] is False
+
+    def test_lossy_file_records_line_and_original_chars(self, fresh_store):
+        receipt = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        assert receipt["status"] == "存在损字"
+        assert receipt["损字行号"] == "2"
+        assert receipt["待处理行号"] == [2]
+        evidence = receipt["损字凭据"][0]
+        assert evidence["原始行号"] == 2
+        assert evidence["原始字符"] == "记录"
+        assert "记录" in evidence["原始行文本"]
+
+    def test_same_content_resubmission_counts_once(self, fresh_store):
+        svc = SERVICES["encoding_norm"]
+        first = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        again = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE",
+                             at="2026-09-03T10:05:00")
+        assert again["回执编号"] == first["回执编号"]
+        assert len(svc.receipts_of_file("FI-R1/B")) == 1
+
+    def test_new_revision_keeps_old_evidence(self, fresh_store):
+        svc = SERVICES["encoding_norm"]
+        lossy = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        fixed = self._submit("FI-R1/B", B_FIXED, at="2026-09-03T10:10:00")
+        assert fixed["修订版次"] == "2"
+        assert fixed["status"] == "已完成"
+        summary = next(f for f in svc.file_summaries("FI-R1") if f["文件键"] == "FI-R1/B")
+        assert summary["已接受"] is True
+        assert summary["可重跑"] is False
+        old = summary["历史证据"][0]
+        assert old["损字行号"] == "2"
+        assert old["损字凭据"][0]["原始字符"] == "记录"
+        assert old["回执编号"] == lossy["回执编号"]
+
+    def test_accepted_file_offers_no_rerun(self, fresh_store):
+        svc = SERVICES["encoding_norm"]
+        self._submit("FI-R1/A", A_FILE)
+        summary = svc.file_summaries("FI-R1")[0]
+        assert summary["已接受"] is True
+        assert summary["可重跑"] is False
+
+    def test_resume_from_failed_line_dedupes_processed_rows(self, fresh_store):
+        svc = SERVICES["encoding_norm"]
+        receipt = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        ok, _msg, view = svc.resume_receipt(receipt["回执编号"], [2, 2], resumed_from=2)
+        assert ok is True
+        assert view["已处理行号"] == [2]
+        assert view["待处理行号"] == []
+        next_step = svc.next_step(receipt["回执编号"])
+        assert next_step["动作"] == "转码已完成"
+
+    def test_batch_receipts_give_per_file_next_step(self, fresh_store):
+        svc = SERVICES["encoding_norm"]
+        self._submit("FI-R1/A", A_FILE)
+        lossy = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        batch = svc.receipt_batch(["FI-R1/A", "FI-R1/B"])
+        assert batch["total"] == 2
+        by_file = {item["文件键"]: item for item in batch["items"]}
+        assert by_file["FI-R1/A"]["状态"] == "已完成"
+        assert by_file["FI-R1/B"]["下一步"]["动作"] == "从失败行继续"
+        assert by_file["FI-R1/B"]["下一步"]["续做行号"] == 2
+        assert lossy["可继续"] is True
+
+    def test_receipt_review_shows_adopted_result(self, fresh_store):
+        enc = SERVICES["encoding_norm"]
+        quarantine = SERVICES["row_quarantine"]
+        receipt = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        assert quarantine.consume_lossy_receipt(receipt["回执编号"], "t")["created"]
+        qno = "RQ-" + receipt["回执编号"] + "-2"
+        quarantine.submit_review(qno, "reviewer-01")
+        ok, _msg, _row = quarantine.reinstate_to_batch(
+            qno, "reviewer-01", "人工修正", "t2", {"rec_id": "R-3X"})
+        assert ok is True
+        review = quarantine.receipt_review_result(receipt["回执编号"])
+        item = review["items"][0]
+        assert item["原始行号"] == "2"
+        assert item["原始字符"] == "记录"
+        assert item["隔离状态"] == "已回补"
+        assert "R-3X" in item["回补结果"]
+        # 回补后回执没有待处理行，页面不再提供重跑
+        summary = next(f for f in enc.file_summaries("FI-R1") if f["文件键"] == "FI-R1/B")
+        assert summary["可重跑"] is False
+
+    def test_interrupted_reinstate_and_revision_do_not_double_count(self, fresh_store):
+        """班组在回补 B 第 2 行时重传修正版并中断：重启后 A 仍两行、B 第 2 行只确认一次。"""
+        enc = SERVICES["encoding_norm"]
+        quarantine = SERVICES["row_quarantine"]
+        batch_svc = SERVICES["parse_batch"]
+        field_svc = SERVICES["field_parse"]
+        store.rows("parse_batch").append({
+            "id": 980, "status": "存在隔离", "pending": True, "abnormal": True,
+            "批次记录编号": "PB-R1", "关联投递批次": "FI-R1",
+            "解析器标识": "csv_parser_v2", "总行数": "6", "成功行数": "4",
+            "隔离行数": "2", "批次状态": "存在隔离", "完成时间": "",
+        })
+
+        a = self._submit("FI-R1/A", A_FILE)
+        b1 = self._submit("FI-R1/B", B_LOSSY, encoding="UTF-16-LE")
+        for receipt in (a, b1):
+            for index, line in enumerate(receipt["转码后文本"].splitlines(), start=1):
+                if index in receipt["待处理行号"]:
+                    continue
+                field_svc.record_parsed_field(
+                    f"FP-{receipt['回执编号']}-{index}", "FI-R1", "ET-001", "rec_id",
+                    line, line, 1, index, True,
+                    source_file=receipt["文件键"], source_receipt=receipt["回执编号"])
+        quarantine.consume_lossy_receipt(b1["回执编号"], "t1")
+        qno = "RQ-" + b1["回执编号"] + "-2"
+        quarantine.submit_review(qno, "duty-01")
+        ok, _msg, _row = quarantine.reinstate_to_batch(
+            qno, "duty-01", "人工修正", "t2", {"rec_id": "R-3X"})
+        assert ok is True
+
+        # 修正版 B 到达（同名新修订版），值班员正在回补旧 B 第 2 行时进程中断
+        b2 = self._submit("FI-R1/B", B_FIXED, at="t3")
+        assert b2["修订版次"] == "2"
+        assert b2["status"] == "已完成"
+
+        # 重启后从任一个入口继续：重复提交相同内容只记一次
+        replay = self._submit("FI-R1/B", B_FIXED, at="t4")
+        assert replay["回执编号"] == b2["回执编号"]
+        assert len(enc.receipts_of_file("FI-R1/B")) == 2
+
+        # 已确认的原行在后续修订版里不再重复要求确认
+        assert b2["待处理行号"] == []
+        summaries = {item["文件键"]: item for item in enc.file_summaries("FI-R1")}
+        assert summaries["FI-R1/A"]["已接受"] is True
+        assert summaries["FI-R1/B"]["可继续"] is False
+        old_evidence = summaries["FI-R1/B"]["历史证据"][0]
+        assert old_evidence["损字凭据"][0]["原始字符"] == "记录"
+
+        # 重复回补同一原行不重复计数
+        ok_again, msg_again, _row2 = quarantine.reinstate_to_batch(
+            qno, "duty-01", "重复提交", "t5", {"rec_id": "R-3X"})
+        assert ok_again is False
+        ok_refresh, _m, batch = batch_svc.refresh_batch_counts("FI-R1")
+        assert ok_refresh is True
+        assert batch["总行数"] == "6"
+        assert batch["成功行数"] == "6"
+        assert batch["隔离行数"] == "0"
+
+        trace = field_svc.source_trace(f"FP-{qno}-rec_id")
+        assert trace["来源文件"] == "FI-R1/B"
+        assert trace["解析行号"] == "2"
+        assert trace["原始字符"] == "记录"

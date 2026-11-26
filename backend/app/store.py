@@ -16,7 +16,8 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        """对外的业务模块清单：下划线开头的是服务内部账本，不参与模块看板。"""
+        return sorted(name for name in self._tables if not name.startswith("_"))
 
     def reload_seed(self) -> None:
         """把全部表恢复成 seed.py 的初始示例数据，供本地重置与测试隔离使用。"""

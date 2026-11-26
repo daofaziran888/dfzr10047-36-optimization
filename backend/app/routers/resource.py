@@ -96,3 +96,14 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.post("/row_quarantine/{quarantine_no}/reinstate", response_model=ActionResult)
+def reinstate_row(quarantine_no: str, payload: ReinstatePayload) -> ActionResult:
+    """复核生效后按原行回补：只对复核中的损字行生效，同一原行只计一次。"""
+    from app.services.row_quarantine import RowQuarantineService
+
+    ok, message, row = RowQuarantineService().reinstate_to_batch(
+        quarantine_no, payload.reviewer, payload.conclusion,
+        payload.review_time, payload.corrected or None)
+    return ActionResult(ok=ok, message=message, entry=row)

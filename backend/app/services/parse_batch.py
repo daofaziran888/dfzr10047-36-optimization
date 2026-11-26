@@ -29,35 +29,49 @@ class ParseBatchService(BaseModuleService):
         return None
 
     def tally_from_field_parse(self, intake_batch: str) -> dict[str, int]:
-        """从字段解析明细聚合行级统计：成功行数与部分失败行数。"""
+        """从字段解析明细聚合行级统计：按「来源文件 + 原行号」去重后计成功/失败行。"""
         parsed = store.rows("field_parse")
         rows_of_batch = [r for r in parsed if r.get("关联批次") == intake_batch]
-        row_numbers: dict[str, bool] = {}
+        row_keys: dict[tuple[str, str], bool] = {}
         for r in rows_of_batch:
             line = str(r.get("解析行号") or "")
             if not line:
                 continue
+            key = (str(r.get("来源文件") or "batch:" + intake_batch), line)
             ok = r.get("status") == "解析成功"
-            row_numbers[line] = row_numbers.get(line, True) and ok
-        success = sum(1 for ok in row_numbers.values() if ok)
-        failed = sum(1 for ok in row_numbers.values() if not ok)
-        return {"total_rows": len(row_numbers), "success_rows": success, "failed_rows": failed}
+            row_keys[key] = row_keys.get(key, True) and ok
+        success = sum(1 for ok in row_keys.values() if ok)
+        failed = sum(1 for ok in row_keys.values() if not ok)
+        return {"total_rows": len(row_keys), "success_rows": success,
+                "failed_rows": failed, "row_keys": row_keys}
 
     def tally_from_quarantine(self, intake_batch: str) -> dict[str, int]:
-        """从坏行隔离明细统计真实隔离行数与已回补行数。"""
+        """从坏行隔离明细统计真实隔离行数与已回补行数，同一原行只算一次。"""
         rows = [
             r for r in store.rows("row_quarantine")
             if r.get("关联批次") == intake_batch
         ]
+        distinct: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in rows:
+            key = (str(r.get("文件键") or "batch:" + intake_batch),
+                   str(r.get("原始行号") or ""))
+            # 同一原行多次登记时，以已回补/已废弃的终态为准
+            if key not in distinct or r.get("status") in ("已回补", "已废弃"):
+                distinct[key] = r
+        values = list(distinct.values())
         return {
-            "quarantined": len(rows),
-            "reinstated": sum(1 for r in rows if r.get("status") == "已回补"),
-            "discarded": sum(1 for r in rows if r.get("status") == "已废弃"),
-            "unreviewed": sum(1 for r in rows if r.get("status") in ("已隔离", "复核中")),
+            "quarantined": len(values),
+            "reinstated": sum(1 for r in values if r.get("status") == "已回补"),
+            "discarded": sum(1 for r in values if r.get("status") == "已废弃"),
+            "unreviewed": sum(1 for r in values if r.get("status") in ("已隔离", "复核中")),
         }
 
     def refresh_batch_counts(self, intake_batch: str) -> tuple[bool, str, dict[str, Any] | None]:
-        """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。"""
+        """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。
+
+        已确认回补的原行只计一次：回补已写回字段解析的，不重复加到成功行数；
+        重复提交的同一文件、同一原行也不会把总行数抬高。
+        """
         batch = self._find_by_intake(intake_batch)
         if batch is None:
             return False, f"投递批次 {intake_batch} 没有对应批次记录", None
@@ -66,15 +80,25 @@ class ParseBatchService(BaseModuleService):
 
         parse_tally = self.tally_from_field_parse(intake_batch)
         quarantine_tally = self.tally_from_quarantine(intake_batch)
-        quarantined = quarantine_tally["quarantined"] - quarantine_tally["reinstated"]
-        success = parse_tally["success_rows"] + quarantine_tally["reinstated"]
+        parse_row_keys = parse_tally["row_keys"]
+        reinstated_keys = {
+            (str(r.get("文件键") or "batch:" + intake_batch),
+             str(r.get("原始行号") or ""))
+            for r in store.rows("row_quarantine")
+            if r.get("关联批次") == intake_batch and r.get("status") == "已回补"
+        }
+        # 回补行已经写回字段解析的部分不再重复加成功数
+        unparsed_reinstated = len(reinstated_keys - set(parse_row_keys))
+        all_keys = set(parse_row_keys) | reinstated_keys
+        success = parse_tally["success_rows"] + unparsed_reinstated
+        quarantined = max(0, len(all_keys) - success)
 
-        batch["总行数"] = str(parse_tally["total_rows"])
+        batch["总行数"] = str(len(all_keys))
         batch["成功行数"] = str(success)
-        batch["隔离行数"] = str(max(0, quarantined))
+        batch["隔离行数"] = str(quarantined)
         return True, (
             f"批次 {intake_batch} 计数已按真实明细刷新："
-            f"总 {parse_tally['total_rows']} / 成功 {success} / 隔离 {max(0, quarantined)}"
+            f"总 {len(all_keys)} / 成功 {success} / 隔离 {quarantined}"
         ), dict(batch)
 
     def close_batch(self, intake_batch: str, close_time: str) -> tuple[bool, str, dict[str, Any] | None]:
